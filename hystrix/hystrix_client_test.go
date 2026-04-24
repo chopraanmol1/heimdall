@@ -606,7 +606,13 @@ func TestHystrixHTTPClientDoContextCancelled(t *testing.T) {
 	const cmdName = "some_command_name_for_ctx_cncl"
 	r := newSimpleMetricRegistry()
 
-	client := NewClient(WithCommandName(cmdName))
+	client := NewClient(
+		WithCommandName(cmdName),
+		WithRetryCount(3),
+		WithRetrier(heimdall.NewRetrierFunc(func(retry int) time.Duration {
+			assert.Fail(t, "should not invoke retrier func due to context cancellation")
+			return 0
+		})))
 
 	req, err := http.NewRequest(http.MethodGet, "http://localhost/test", nil)
 	require.NoError(t, err)
@@ -630,6 +636,43 @@ func TestHystrixHTTPClientDoContextCancelled(t *testing.T) {
 	assert.Zero(t, m.FallbackSuccesses)
 	assert.Zero(t, m.FallbackFailures)
 	assert.Zero(t, m.ContextDeadlineExceeded)
+}
+
+func TestHystrixHTTPClientDoContextCancelledDuringRetryBackoff(t *testing.T) {
+	const cmdName = "some_command_name_for_ctx_cncl"
+	ctx, cnclFN := context.WithCancel(context.Background())
+
+	var retrierFuncCount int
+	var retrierFuncStartTime time.Time
+
+	client := NewClient(
+		WithCommandName(cmdName),
+		WithRetryCount(3),
+		WithRetrier(heimdall.NewRetrierFunc(func(retry int) time.Duration {
+			retrierFuncStartTime = time.Now()
+			retrierFuncCount++
+			cnclFN()
+			return time.Hour
+		})))
+
+	var reqCount int
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		reqCount++
+		rw.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+
+	response, err := client.Do(req)
+	endTime := time.Now()
+	require.Contains(t, err.Error(), context.Canceled.Error())
+	require.Nil(t, response)
+	require.Equal(t, 1, retrierFuncCount)
+	assert.Equal(t, 1, reqCount)
+	assert.Less(t, endTime.Sub(retrierFuncStartTime), time.Millisecond)
+
+	time.Sleep(time.Second)
 }
 
 func TestResponseBodyStreaming(t *testing.T) {
